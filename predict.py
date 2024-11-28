@@ -7,12 +7,17 @@ import os.path as osp
 import numpy as np
 import cv2
 import torch
-import gc
 import sys
 import tempfile
-import shutil
 from cog import BasePredictor, Input, Path
+from pydantic import BaseModel
+from typing import Dict, List
+import numpy as np
+from pycocotools import mask as mask_util
 
+class TrackingResult(BaseModel):
+    video_path: Path
+    segmentation_masks: Dict[int, List[Dict]]  # frame_idx -> list of RLE masks for that frame
 # Add the sam2 module to the Python path
 sys.path.append("./sam2")
 
@@ -83,123 +88,112 @@ class Predictor(BasePredictor):
         self.model_path = "sam2/checkpoints/sam2.1_hiera_base_plus.pt"
         self.model_cfg = determine_model_cfg(self.model_path)
         self.predictor = build_sam2_video_predictor(self.model_cfg, self.model_path, device=DEVICE)
-
+    
     def predict(
-        self,
-        video: Path = Input(description="Input video to process"),
-        x_coordinate: int = Input(description="x-coordinate of top-left corner of bounding box", default=100),
-        y_coordinate: int = Input(description="y-coordinate of top-left corner of bounding box", default=100),
-        width: int = Input(description="Width of bounding box", default=400),
-        height: int = Input(description="Height of bounding box", default=300),
-    ) -> Path:
+    self,
+    video: Path = Input(description="Input video to process"),
+    x_coordinate: int = Input(description="x-coordinate of top-left corner of bounding box", default=100),
+    y_coordinate: int = Input(description="y-coordinate of top-left corner of bounding box", default=100),
+    width: int = Input(description="Width of bounding box", default=400),
+    height: int = Input(description="Height of bounding box", default=300),
+    ) -> TrackingResult:
         """Run object tracking on the input video with the specified bounding box"""
-        try:
-            # Prepare video input
-            frames_or_path = prepare_frames_or_path(str(video))
-            bbox = (x_coordinate, y_coordinate, x_coordinate + width, y_coordinate + height)
-            prompts = {0: (bbox, 0)}  # Initialize with first frame bbox
-            color = [(255, 0, 0)]  # Red color for visualization
-            
-            # Create temporary directory for frame processing
-            temp_dir = tempfile.mkdtemp()
-            frame_count = 0
 
-            print("[*] Loading video frames...")
-            # Load video frames
-            if osp.isdir(str(video)):
-                # Handle directory of frames
-                frames = sorted([osp.join(str(video), f) for f in os.listdir(str(video)) if f.endswith(".jpg")])
-                loaded_frames = [cv2.imread(frame_path) for frame_path in frames]
-                frame_height, frame_width = loaded_frames[0].shape[:2]
-                fps = 30  # Default fps for image sequence
-            else:
-                # Handle video file
-                cap = cv2.VideoCapture(str(video))
-                loaded_frames = []
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    loaded_frames.append(frame)
-                cap.release()
-                if len(loaded_frames) == 0:
-                    raise ValueError("No frames were loaded from the video.")
-                frame_height, frame_width = loaded_frames[0].shape[:2]
+        # Initialize RLE storage
+        segmentation_masks = {}
+        
+        # Prepare video input
+        frames_or_path = prepare_frames_or_path(str(video))
+        bbox = (x_coordinate, y_coordinate, x_coordinate + width, y_coordinate + height)
+        prompts = {0: (bbox, 0)}
+        color = [(255, 0, 0)]  # Red color for visualization
+        
+        # Create temporary directory for frame processing
+        temp_dir = tempfile.mkdtemp()
+        frame_count = 0
 
-            num_frames = len(loaded_frames)
-            print(f"[+] Loaded {num_frames} frames")
 
-            print("[*] Processing frames with model...")
-            # Process video with model
-            with torch.inference_mode(), torch.autocast(DEVICE, dtype=torch.float16):
-                # Initialize state with first frame
-                state = self.predictor.init_state(frames_or_path, offload_video_to_cpu=True)
-                bbox, track_label = prompts[0]
-                _, _, masks = self.predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
+        print("[*] Loading video frames...")
+        # Load video frames
+        if osp.isdir(str(video)):
+            frames = sorted([osp.join(str(video), f) for f in os.listdir(str(video)) if f.endswith(".jpg")])
+            loaded_frames = [cv2.imread(frame_path) for frame_path in frames]
+            frame_height, frame_width = loaded_frames[0].shape[:2]
+            fps = 30
+        else:
+            cap = cv2.VideoCapture(str(video))
+            loaded_frames = []
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                loaded_frames.append(frame)
+            cap.release()
+            if len(loaded_frames) == 0:
+                raise ValueError("No frames were loaded from the video.")
+            frame_height, frame_width = loaded_frames[0].shape[:2]
 
-                # Process each frame
-                for frame_idx, object_ids, masks in self.predictor.propagate_in_video(state):
-                    # Check if frame_idx is valid
-                    if frame_idx >= num_frames:
-                        print(f"[!] Warning: frame_idx {frame_idx} exceeds number of loaded frames {num_frames}")
-                        continue
+        num_frames = len(loaded_frames)
+        print(f"[+] Loaded {num_frames} frames")
 
-                    mask_to_vis = {}
-                    bbox_to_vis = {}
+        print("[*] Processing frames with model...")
+        # Process video with model
+        with torch.inference_mode(), torch.autocast(DEVICE, dtype=torch.float16):
+            # Initialize state with first frame
+            state = self.predictor.init_state(frames_or_path, offload_video_to_cpu=True)
+            bbox, track_label = prompts[0]
+            _, _, masks = self.predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
 
-                    # Process each object in the frame
-                    for obj_id, mask in zip(object_ids, masks):
-                        mask = mask[0].cpu().numpy()
-                        mask = mask > 0.0
-                        non_zero_indices = np.argwhere(mask)
-                        if len(non_zero_indices) == 0:
-                            bbox = [0, 0, 0, 0]
-                        else:
-                            y_min, x_min = non_zero_indices.min(axis=0).tolist()
-                            y_max, x_max = non_zero_indices.max(axis=0).tolist()
-                            bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
-                        bbox_to_vis[obj_id] = bbox
-                        mask_to_vis[obj_id] = mask
+            # Process each frame
+            for frame_idx, object_ids, masks in self.predictor.propagate_in_video(state):
+                if frame_idx >= num_frames:
+                    print(f"[!] Warning: Skipping frame {frame_idx} as it exceeds number of loaded frames")
+                    continue
 
-                    # Visualize results on frame
-                    img = loaded_frames[frame_idx].copy()
+                # Initialize list for this frame's masks
+                segmentation_masks[frame_idx] = []
+                
+                # Initialize frame visualization
+                img = loaded_frames[frame_idx].copy()
+                mask_img = np.zeros((frame_height, frame_width, 3), np.uint8)
+                
+                # Process each object mask in the frame
+                for obj_id, mask in zip(object_ids, masks):
+                    # Convert mask to binary numpy array
+                    mask = mask[0].cpu().numpy() > 0.0
                     
-                    # Draw masks
-                    for obj_id, mask in mask_to_vis.items():
-                        mask_img = np.zeros((frame_height, frame_width, 3), np.uint8)
-                        mask_img[mask] = color[(obj_id + 1) % len(color)]
-                        img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
+                    # Convert to COCO RLE format
+                    mask_fortran = np.asfortranarray(mask.astype(np.uint8))
+                    rle = mask_util.encode(mask_fortran)
+                    
+                    # Store mask with metadata
+                    mask_data = {
+                        'counts': rle['counts'].decode('utf-8'),
+                        'size': rle['size'],
+                        'object_id': int(obj_id)
+                    }
+                    segmentation_masks[frame_idx].append(mask_data)
 
-                    # Draw bounding boxes
-                    for obj_id, bbox in bbox_to_vis.items():
-                        cv2.rectangle(img, 
-                                    (bbox[0], bbox[1]),
-                                    (bbox[0] + bbox[2], bbox[1] + bbox[3]),
-                                    color[obj_id % len(color)], 2)
+                    # Add this object's mask to visualization
+                    mask_img[mask] = color[obj_id % len(color)]
+                
+                # Combine all masks with original frame
+                img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
+                
+                # Save processed frame
+                frame_path = os.path.join(temp_dir, f"frame_{frame_idx:05d}.png")
+                cv2.imwrite(frame_path, img)
 
-                    # Save processed frame
-                    frame_path = os.path.join(temp_dir, f"frame_{frame_count:05d}.png")
-                    cv2.imwrite(frame_path, img)
-                    frame_count += 1
+        print("[*] Generating output video...")
+        # Generate output video
+        video_name = os.path.basename(str(video))
+        output_path = f"visualization/samurai/base_plus/{video_name}"
+        frames_pattern = os.path.join(temp_dir, "frame_%05d.png")
+        ffmpeg_cmd = f"ffmpeg -y -r {fps} -i {frames_pattern} -c:v libx264 -pix_fmt yuv420p {output_path}"
+        os.system(ffmpeg_cmd)
 
-            print("[*] Generating output video...")
-            # Generate output video
-            video_name = os.path.basename(str(video))
-            output_path = f"visualization/samurai/base_plus/{video_name}"
-            frames_pattern = os.path.join(temp_dir, "frame_%05d.png")
-            ffmpeg_cmd = f"ffmpeg -y -r {fps} -i {frames_pattern} -c:v libx264 -pix_fmt yuv420p {output_path}"
-            os.system(ffmpeg_cmd)
-            
-            print("[+] Cleaning up...")
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir)
-
-            return Path(output_path)
-
-        except Exception as e:
-            print(f"[ERROR] An error occurred: {str(e)}")
-            # Clean up on error
-            if 'temp_dir' in locals():
-                shutil.rmtree(temp_dir)
-            raise e
+        return TrackingResult(
+            video_path=Path(output_path),
+            segmentation_masks=segmentation_masks
+        )

@@ -36,6 +36,7 @@ build:
     - "scipy"
     - "decord"
     - "loguru"
+    - "pycocotools"
 
   # commands run after the environment is setup
   run:
